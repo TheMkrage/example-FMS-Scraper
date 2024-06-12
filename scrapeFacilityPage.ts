@@ -1,58 +1,111 @@
 
+import { Page, TimeoutError } from 'puppeteer';
+
 import { SelfStorageFacilityWebScrapeResult } from '../../../selfStorageClassicScrapers/base/model/selfStorageWebScrapeResult';
-import puppeteer, { Page } from 'puppeteer';
 import cheerio from 'cheerio';
-import { scrapeRentRow } from './scrapeRentRow';
-import { accessPageWithPuppeteer } from '../../../puppeteer/puppeteer';
-import { extractAddress } from '../../../selfStorageClassicScrapers/base/extractors/extractAddress';
-import { FullProperty } from '../../../../../src/model/prisma/prisma';
-import { PropRisePrismaClient } from '@/api_helper/prisma/prisma';
+import { SmartScraperError } from '../../run';
+import { delay } from '@/model/generic/generic';
 
-export async function scrapeEasyStorageSolutions(page: Page, url: string, fullProperty?: FullProperty): Promise<SelfStorageFacilityWebScrapeResult | undefined> {
-    // Extract the HTML content from the page
-    const content = await page.content();
+export async function scrapeTenant(page: Page, url: string): Promise<SelfStorageFacilityWebScrapeResult | undefined> {
+	// this should timeout after some time if it does not resolve?
+	try {
+		// set up network listeners and then refresh the page. 
+		await page.setRequestInterception(true);
 
-    // Load the HTML content into cheerio for parsing
-    const $ = cheerio.load(content);
+		// Create a promise to capture the response data
+		let resolvePromise: (value: string | PromiseLike<string>) => void;
+		let rejectPromise: (reason?: any) => void;
 
-    const phone = $('p:nth-child(3) a').first().text().trim();
-    const website = url;
+		const promiseRawJsonFromDataFacInfo = new Promise<string>(async (resolve, reject) => {
+			resolvePromise = resolve;
+			rejectPromise = reject;
 
-    const footer = $('footer.widget-footer.primary-background');
-    const addressText = footer.find('div.col-sm-4').first().find('p span').first().text().trim();
+			// Response listener for network requests
+			page.on('response', async (response) => {
+				try {
+					const url = response.url();
+					if (url.includes('space-types')) {
+						const data = await response.text();
 
-    let address, cityStateZip, city, stateZip, state, zip;
+						if (data) {
+							resolvePromise(data);
+						} else {
+							rejectPromise("Could not find data-fac-info");
+						}
+					}
+				} catch (error) {
+					console.error("Error reading Tenant response:", error);
+					rejectPromise("Error reading Tenant response: " + error);
+				}
+			});
 
-    try {
-        [address, cityStateZip] = addressText.split('\n').map(line => line.trim());
-        [city, stateZip] = cityStateZip.split(',').map(line => line.trim());
-        [state, zip] = stateZip.split(' ').map(line => line.trim());
-    } catch (error) {
-        address = cityStateZip = city = stateZip = state = zip = '';
-        if (!fullProperty) {
-            console.error('Error breaking down address:', error);
-            throw new Error('Failed to extract address and fullProperty is not provided' + error);
-        }
-    }
-    const facilityName = footer.find('div.col-sm-4').first().find('p strong').text().trim();
-    const result: SelfStorageFacilityWebScrapeResult = {
-        rents: [],
-        "address": fullProperty?.address ?? address,
-        "city": fullProperty?.city ?? city,
-        "state": fullProperty?.state ?? state,
-        "zip": fullProperty?.zipCode ?? zip,
-        name: facilityName,
-        phone,
-        website,
-    };
+			// Request listener for network requests
+			page.on('request', (request) => {
+				try {
+					request.continue();
+				} catch (error) {
+					console.error("Error handling Tenant request:", error);
+					rejectPromise("Error handling Tenant request: " + error);
+				}
+			});
 
-    // Iterate through available unit panels and extract info
-    $('.unit-type').each((_, el) => {
-        result.rents.push(scrapeRentRow(el, url));
-    });
 
-    await page.close()
 
-    // Return the result object with all extracted information
-    return result;
+			try {
+				await page.reload({ waitUntil: 'networkidle0' });
+				// Wait for some time to allow network requests to complete
+				await delay(5000)
+			} catch (error) {
+				console.error("Error reloading page in Tenant: ", error);
+				rejectPromise("Error reloading page in Tenant: " + error)
+			}
+		});
+
+		const timeoutPromise = new Promise<string>((_, reject) => {
+			setTimeout(() => reject(new TimeoutError('Tenant Wait for network timed out after 60 seconds, likely not a rent page')), 60000);
+		});
+
+		// Wait for the promise to resolve or reject
+		const rawJson = await Promise.race([promiseRawJsonFromDataFacInfo, timeoutPromise]);
+
+		// Parse JSON and turn it into a storage rent object
+		const storageInfo = JSON.parse(rawJson) as any;
+		const applicationData = Object.values(storageInfo.applicationData) as any[][];
+
+		const toReturn: SelfStorageFacilityWebScrapeResult = {
+			name: storageInfo.facility_name,
+			address: storageInfo.facility_address,
+			zip: storageInfo.facility_zipcode,
+			city: storageInfo.facility_city,
+			state: storageInfo.facility_state,
+			website: url,
+			rents: applicationData[0][0].data.map((rental: any) => ({
+				date: new Date(),
+				monthlyRentOnline: rental.price ? parseFloat(rental.price.web) : null,
+				monthlyRentInPerson: rental.price ? parseFloat(rental.price.instore) : null,
+				unitDescriptionShort: rental.size_category.label.en,
+				unitDescriptionLong: rental.description.en,
+				unitDimensionsLengthInFeet: rental.width, // backwards because of how they store it is opposite us
+				unitDimensionsWidthInFeet: rental.length,
+				isAvailable: rental.available_count > 0,
+				discounts: rental.promos ? rental.promos.map((promo: any) => promo?.description?.en) : [],
+				unitAmenities: rental.amenities ? rental.amenities.map((f: any) => f.value) : [],
+				source: url,
+				limitedAvailability: rental.available_count < 5,
+				limitedAvailabilityUnitsLeft: (rental.available_count || rental.available_count === 0) ? parseInt(rental.available_count) : null,
+				unitDimensionsHeightInFeet: rental.height || null
+			}))
+		};
+
+		return toReturn;
+	} catch (error: any) {
+		console.error("Tenant:", error);
+		throw new SmartScraperError("Tenant: " + error, "", "Tenant", error)
+	} finally {
+		// Clean up: remove listeners to prevent memory leaks
+		page.removeAllListeners('request');
+		page.removeAllListeners('response');
+	}
+
+	// parse json and turn into a storage rent object
 }
